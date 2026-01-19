@@ -20,13 +20,68 @@ import os
 import sys
 import time
 import json
+import subprocess
+import tempfile
+import shutil
 from datetime import datetime
 
 # Configuration - Update these values with your OCI details
 COMPARTMENT_ID = os.environ.get("OCI_COMPARTMENT_ID", "YOUR_COMPARTMENT_OCID")
 NAMESPACE = None  # Will be auto-detected from OCI
 BUCKET_NAME = os.environ.get("OCI_BUCKET_NAME", "speech-audio-bucket")
-AUDIO_FILE = "New Recording.m4a"
+AUDIO_FILE = None  # Will be set from command line argument
+
+def check_ffmpeg():
+    """Check if ffmpeg is installed."""
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+def convert_audio_to_wav(input_file):
+    """
+    Convert audio file to WAV format using ffmpeg.
+    OCI Speech service supports: WAV, FLAC, OGG, MP3, M4A, WEBM
+    WAV with PCM encoding is the most reliable format.
+    """
+    if not check_ffmpeg():
+        print("Error: ffmpeg is not installed. Please install it:")
+        print("  brew install ffmpeg")
+        sys.exit(1)
+    
+    # Get the base filename without extension
+    base_name = os.path.splitext(os.path.basename(input_file))[0]
+    
+    # Create output WAV file in a temp directory
+    temp_dir = tempfile.mkdtemp()
+    output_file = os.path.join(temp_dir, f"{base_name}.wav")
+    
+    print(f"\nConverting {input_file} to WAV format...")
+    
+    # Convert to WAV with PCM encoding (16-bit, mono, 16kHz - optimal for speech)
+    cmd = [
+        'ffmpeg', '-y',  # Overwrite output file if exists
+        '-i', input_file,  # Input file
+        '-acodec', 'pcm_s16le',  # 16-bit PCM encoding
+        '-ac', '1',  # Mono channel
+        '-ar', '16000',  # 16kHz sample rate (good for speech)
+        output_file
+    ]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"Error converting audio: {result.stderr}")
+            sys.exit(1)
+        
+        print(f"✓ Converted to: {output_file}")
+        print(f"  Converted file size: {os.path.getsize(output_file) / 1024:.2f} KB")
+        return output_file, temp_dir
+        
+    except Exception as e:
+        print(f"Error running ffmpeg: {e}")
+        sys.exit(1)
 
 def get_oci_config():
     """Load OCI configuration from default location or environment."""
@@ -49,6 +104,18 @@ def upload_to_object_storage(config, namespace, bucket_name, file_path):
     object_storage_client = oci.object_storage.ObjectStorageClient(config)
     object_name = os.path.basename(file_path)
     
+    # Determine content type based on file extension
+    ext = os.path.splitext(file_path)[1].lower()
+    content_types = {
+        '.wav': 'audio/wav',
+        '.mp3': 'audio/mpeg',
+        '.flac': 'audio/flac',
+        '.ogg': 'audio/ogg',
+        '.m4a': 'audio/mp4',
+        '.webm': 'audio/webm'
+    }
+    content_type = content_types.get(ext, 'audio/wav')
+    
     # Read the file
     with open(file_path, 'rb') as f:
         file_content = f.read()
@@ -60,7 +127,7 @@ def upload_to_object_storage(config, namespace, bucket_name, file_path):
             bucket_name=bucket_name,
             object_name=object_name,
             put_object_body=file_content,
-            content_type="audio/mp4"
+            content_type=content_type
         )
         print(f"Successfully uploaded {object_name} to bucket {bucket_name}")
         
@@ -214,17 +281,40 @@ def save_transcription(text, output_file="transcription_output.txt"):
 
 def main():
     """Main function to orchestrate the transcription process."""
+    global AUDIO_FILE
+    
     print("=" * 60)
     print("Oracle Cloud OCI Speech-to-Text Converter")
     print("=" * 60)
     
-    # Check if audio file exists
-    if not os.path.exists(AUDIO_FILE):
-        print(f"Error: Audio file '{AUDIO_FILE}' not found!")
+    # Get audio file from command line argument
+    if len(sys.argv) < 2:
+        print("Usage: python speech_to_text.py <audio_file_path>")
+        print("Example: python speech_to_text.py ../soundfiles/EMsound.caf")
         sys.exit(1)
     
-    print(f"Audio file: {AUDIO_FILE}")
-    print(f"File size: {os.path.getsize(AUDIO_FILE) / 1024:.2f} KB")
+    input_file = sys.argv[1]
+    
+    # Check if audio file exists
+    if not os.path.exists(input_file):
+        print(f"Error: Audio file '{input_file}' not found!")
+        sys.exit(1)
+    
+    print(f"Audio file: {input_file}")
+    print(f"File size: {os.path.getsize(input_file) / 1024:.2f} KB")
+    
+    # Check if we need to convert the audio file
+    # OCI Speech service supports: WAV, FLAC, OGG, MP3, M4A, WEBM
+    supported_formats = {'.wav', '.flac', '.ogg', '.mp3', '.m4a', '.webm'}
+    file_ext = os.path.splitext(input_file)[1].lower()
+    temp_dir = None
+    
+    if file_ext not in supported_formats:
+        print(f"\nNote: '{file_ext}' format is not directly supported by OCI Speech.")
+        print("Converting to WAV format using ffmpeg...")
+        AUDIO_FILE, temp_dir = convert_audio_to_wav(input_file)
+    else:
+        AUDIO_FILE = input_file
     
     # Load OCI configuration
     config = get_oci_config()
@@ -242,30 +332,37 @@ def main():
         COMPARTMENT_ID = config.get('tenancy')
         print(f"Using tenancy as compartment: {COMPARTMENT_ID}")
     
-    # Step 1: Upload audio file to Object Storage
-    object_uri, object_name = upload_to_object_storage(
-        config, NAMESPACE, BUCKET_NAME, AUDIO_FILE
-    )
-    
-    # Step 2: Create transcription job
-    job = create_transcription_job(config, COMPARTMENT_ID, object_uri)
-    
-    # Step 3: Wait for job completion
-    completed_job = wait_for_job_completion(config, job.id)
-    
-    # Step 4: Get transcription results
-    transcription_text = get_transcription_results(config, completed_job)
-    
-    # Step 5: Display and save results
-    print("\n" + "=" * 60)
-    print("TRANSCRIPTION RESULT")
-    print("=" * 60)
-    print(transcription_text)
-    print("=" * 60)
-    
-    save_transcription(transcription_text)
-    
-    print("\n✓ Process completed successfully!")
+    try:
+        # Step 1: Upload audio file to Object Storage
+        object_uri, object_name = upload_to_object_storage(
+            config, NAMESPACE, BUCKET_NAME, AUDIO_FILE
+        )
+        
+        # Step 2: Create transcription job
+        job = create_transcription_job(config, COMPARTMENT_ID, object_uri)
+        
+        # Step 3: Wait for job completion
+        completed_job = wait_for_job_completion(config, job.id)
+        
+        # Step 4: Get transcription results
+        transcription_text = get_transcription_results(config, completed_job)
+        
+        # Step 5: Display and save results
+        print("\n" + "=" * 60)
+        print("TRANSCRIPTION RESULT")
+        print("=" * 60)
+        print(transcription_text)
+        print("=" * 60)
+        
+        save_transcription(transcription_text)
+        
+        print("\n✓ Process completed successfully!")
+        
+    finally:
+        # Clean up temporary directory if we created one
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+            print("Cleaned up temporary files.")
 
 if __name__ == "__main__":
     main()
