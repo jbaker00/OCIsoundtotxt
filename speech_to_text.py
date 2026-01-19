@@ -273,8 +273,21 @@ def get_transcription_results(config, job):
     
     return '\n'.join(full_transcription)
 
-def save_transcription(text, output_file="transcription_output.txt"):
-    """Save transcription to a text file."""
+def save_transcription(text, input_audio_file, output_file=None):
+    """Save transcription to a text file in the same directory as the input audio file."""
+    # Get the directory of the input audio file
+    input_dir = os.path.dirname(os.path.abspath(input_audio_file))
+    
+    # Get the base name without extension and create output filename
+    base_name = os.path.splitext(os.path.basename(input_audio_file))[0]
+    
+    if output_file is None:
+        output_file = os.path.join(input_dir, f"{base_name}_transcription.txt")
+    else:
+        # If output_file is provided but not an absolute path, place it in input directory
+        if not os.path.isabs(output_file):
+            output_file = os.path.join(input_dir, output_file)
+    
     with open(output_file, 'w') as f:
         f.write(text)
     print(f"\n✓ Transcription saved to: {output_file}")
@@ -354,7 +367,7 @@ def main():
         print(transcription_text)
         print("=" * 60)
         
-        save_transcription(transcription_text)
+        save_transcription(transcription_text, input_file)
         
         print("\n✓ Process completed successfully!")
         
